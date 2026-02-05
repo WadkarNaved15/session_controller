@@ -80,14 +80,14 @@ pub fn write_session_config(
             args: vec!["-fullscreen".into(), "-noeac".into()],
             working_dir: exe.parent().unwrap().display().to_string(),
             expected_hash: None,
-            launch_timeout_seconds: 60,
+            launch_timeout_seconds: 120,
             grace_period_seconds: 5,
         },
 
         monitoring: MonitoringConfig {
             poll_interval_ms: 100,
             focus_loss_grace_period_ms: 15_000,
-            max_total_focus_loss_seconds: 60,
+            max_total_focus_loss_seconds: 120,
             cpu_threshold_percent: 95.0,
             memory_limit_mb: 8192,
         },

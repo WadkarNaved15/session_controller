@@ -127,14 +127,10 @@ let child = match supervisor::start_supervisor(&session_json) {
     }
 };
 
-
-notify_backend(&req.backend_api_url, &req.backend_api_key, &req.session_id, "running", None).await;
-
-
     let mut sessions = state.sessions.lock().unwrap();
     let entry = sessions.get_mut(&req.session_id).unwrap();
     entry.supervisor = Some(child);
-    entry.state = SessionState::Running;
+    entry.state = SessionState::Launching;
 
     Ok(Json("started"))
 }
