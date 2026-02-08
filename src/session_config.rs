@@ -1,6 +1,9 @@
 use anyhow::Result;
 use serde::Serialize;
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Serialize)]
 pub struct SessionConfig {
@@ -12,6 +15,7 @@ pub struct SessionConfig {
     pub logging: LoggingConfig,
     pub moonlight: MoonlightConfig,
     pub backend: BackendConfig,
+    pub cleanup: CleanupConfig,
 }
 
 #[derive(Serialize)]
@@ -22,6 +26,7 @@ pub struct GameConfig {
     pub working_dir: String,
     pub expected_hash: Option<String>,
     pub launch_timeout_seconds: u64,
+    pub launch_stability_seconds: u64,
     pub grace_period_seconds: u64,
 }
 
@@ -59,6 +64,27 @@ pub struct BackendConfig {
     pub notify_on_completion: bool,
 }
 
+#[derive(Serialize, Clone, Debug)]
+pub struct CleanupConfig {
+    pub on_normal_exit: bool,
+    pub on_violation: bool,
+    pub on_timeout: bool,
+    pub delete_game_files: bool,
+    pub shared_build: bool,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            on_normal_exit: false,
+            on_violation: true,
+            on_timeout: true,
+            delete_game_files: false,
+            shared_build: false,
+        }
+    }
+}
+
 pub fn write_session_config(
     dir: &Path,
     session_id: &str,
@@ -67,7 +93,9 @@ pub fn write_session_config(
     max_duration: u64,
     backend_url: &str,
     backend_key: &str,
+    cleanup_policy: CleanupConfig,
 ) -> Result<PathBuf> {
+    fs::create_dir_all(dir)?;
     fs::create_dir_all(dir.join("logs"))?;
 
     let cfg = SessionConfig {
@@ -81,6 +109,7 @@ pub fn write_session_config(
             working_dir: exe.parent().unwrap().display().to_string(),
             expected_hash: None,
             launch_timeout_seconds: 120,
+            launch_stability_seconds: 20,
             grace_period_seconds: 5,
         },
 
@@ -93,10 +122,19 @@ pub fn write_session_config(
         },
 
         allowed_processes: vec![
-            "cmd.exe","Game.exe","EasyAntiCheat.exe","EOSOverlayRenderer.exe",
-            "nvcontainer.exe","steam.exe","steamservice.exe",
-            "steamwebhelper.exe","dxdiag.exe",
-        ].into_iter().map(String::from).collect(),
+            "cmd.exe",
+            "Game.exe",
+            "EasyAntiCheat.exe",
+            "EOSOverlayRenderer.exe",
+            "nvcontainer.exe",
+            "steam.exe",
+            "steamservice.exe",
+            "steamwebhelper.exe",
+            "dxdiag.exe",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect(),
 
         logging: LoggingConfig {
             log_file: "logs/supervisor.log".into(),
@@ -106,8 +144,10 @@ pub fn write_session_config(
 
         moonlight: MoonlightConfig {
             service_names: vec!["ApolloService".into()],
-            process_names: vec!["web-server.exe","sunshine.exe","streamer.exe"]
-                .into_iter().map(String::from).collect(),
+            process_names: vec!["apollo.exe", "web-server.exe", "sunshine.exe", "streamer.exe"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
             terminate_on_violation: true,
             force_terminate: true,
         },
@@ -120,6 +160,8 @@ pub fn write_session_config(
             notify_on_violation: true,
             notify_on_completion: true,
         },
+
+        cleanup: cleanup_policy,
     };
 
     let path = dir.join("session.json");
