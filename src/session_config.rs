@@ -16,6 +16,7 @@ pub struct SessionConfig {
     pub moonlight: MoonlightConfig,
     pub backend: BackendConfig,
     pub cleanup: CleanupConfig,
+    pub lockdown: LockdownConfig,
 }
 
 #[derive(Serialize)]
@@ -85,6 +86,32 @@ impl Default for CleanupConfig {
     }
 }
 
+/// ✨ NEW: Lockdown configuration
+#[derive(Serialize, Clone, Debug)]
+pub struct LockdownConfig {
+    pub enabled: bool,
+    pub force_focus: bool,
+    pub block_alt_tab: bool,
+    pub block_task_manager: bool,
+    pub block_explorer: bool,
+    pub kill_unauthorized: bool,
+    pub focus_check_interval_ms: u64,
+}
+
+impl Default for LockdownConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            force_focus: true,
+            block_alt_tab: true,
+            block_task_manager: true,
+            block_explorer: true,
+            kill_unauthorized: true,
+            focus_check_interval_ms: 100,
+        }
+    }
+}
+
 pub fn write_session_config(
     dir: &Path,
     session_id: &str,
@@ -94,9 +121,20 @@ pub fn write_session_config(
     backend_url: &str,
     backend_key: &str,
     cleanup_policy: CleanupConfig,
+    lockdown_enabled: bool,
 ) -> Result<PathBuf> {
     fs::create_dir_all(dir)?;
     fs::create_dir_all(dir.join("logs"))?;
+
+    let lockdown_config = LockdownConfig {
+        enabled: lockdown_enabled,
+        force_focus: true,
+        block_alt_tab: true,
+        block_task_manager: true,
+        block_explorer: true,
+        kill_unauthorized: true,
+        focus_check_interval_ms: 100,
+    };
 
     let cfg = SessionConfig {
         session_id: session_id.into(),
@@ -115,8 +153,8 @@ pub fn write_session_config(
 
         monitoring: MonitoringConfig {
             poll_interval_ms: 100,
-            focus_loss_grace_period_ms: 15_000,
-            max_total_focus_loss_seconds: 120,
+            focus_loss_grace_period_ms: if lockdown_enabled { 0 } else { 15_000 },
+            max_total_focus_loss_seconds: if lockdown_enabled { 0 } else { 120 },
             cpu_threshold_percent: 95.0,
             memory_limit_mb: 8192,
         },
@@ -162,6 +200,7 @@ pub fn write_session_config(
         },
 
         cleanup: cleanup_policy,
+        lockdown: lockdown_config,
     };
 
     let path = dir.join("session.json");

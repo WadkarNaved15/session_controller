@@ -64,11 +64,13 @@ async fn watch_supervisor(
     mut supervisor: Child,
     app_state: AppState,
     cleanup_policy: session_config::CleanupConfig,
+    lockdown_enabled: bool,
     backend_url: String,
     backend_key: String,
 ) {
     info!(
         session_id = %session_id,
+        lockdown_mode = lockdown_enabled,
         "Supervisor watcher started"
     );
 
@@ -128,12 +130,32 @@ async fn watch_supervisor(
         "Translated supervisor exit code to reason"
     );
 
-    // Decide if cleanup is needed based on policy
-    let should_cleanup = match reason {
-        ExitReason::GameExitedNormally => cleanup_policy.on_normal_exit,
-        ExitReason::MaxDurationExceeded => cleanup_policy.on_timeout,
-        _ if reason.is_violation() => cleanup_policy.on_violation,
-        _ => false,
+    // ✨ LOCKDOWN MODE: Always cleanup
+    // NORMAL MODE: Selective cleanup based on reason
+    let should_cleanup = if lockdown_enabled {
+        info!(
+            session_id = %session_id,
+            "Lockdown mode: forcing cleanup"
+        );
+        true
+    } else {
+        match reason {
+            // Only cleanup on game termination
+            ExitReason::GameExitedNormally => cleanup_policy.on_normal_exit,
+            ExitReason::GameExitedWithError => cleanup_policy.on_normal_exit,
+            ExitReason::MaxDurationExceeded => cleanup_policy.on_timeout,
+            ExitReason::GameCrashed => cleanup_policy.on_violation,
+            ExitReason::IntegrityViolation => cleanup_policy.on_violation,
+            ExitReason::LaunchTimeout => cleanup_policy.on_violation,
+            ExitReason::TotalFocusLossExceeded => cleanup_policy.on_violation,
+            
+            // DON'T cleanup on non-terminal violations (normal mode only)
+            ExitReason::FocusLost => false,
+            ExitReason::UnauthorizedProcess => false,
+            
+            // Other cases
+            _ => false,
+        }
     };
 
     if should_cleanup {
@@ -141,7 +163,9 @@ async fn watch_supervisor(
             session_id = %session_id,
             game_id = %game_id,
             build_id = %build_id,
-            "Cleanup required based on policy"
+            reason = %reason,
+            lockdown_mode = lockdown_enabled,
+            "Cleanup required"
         );
 
         // Determine cleanup strategy
@@ -189,7 +213,8 @@ async fn watch_supervisor(
     } else {
         info!(
             session_id = %session_id,
-            "No cleanup required based on policy"
+            reason = %reason,
+            "No cleanup required"
         );
     }
 
@@ -234,6 +259,10 @@ pub struct StartSessionRequest {
     pub delete_game_files: bool,
     #[serde(default)]
     pub shared_build: bool,
+
+    // ✨ NEW: Lockdown mode flag from backend
+    #[serde(default)]
+    pub lockdown_enabled: bool,
 }
 
 fn default_cleanup_on_violation() -> bool {
@@ -251,6 +280,7 @@ pub async fn start_session(
         session_id = %req.session_id,
         game_id = %req.game_id,
         build_id = %req.build_id,
+        lockdown_enabled = req.lockdown_enabled,
         "Starting session"
     );
 
@@ -342,6 +372,7 @@ pub async fn start_session(
         &req.backend_api_url,
         &req.backend_api_key,
         cleanup_policy.clone(),
+        req.lockdown_enabled,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -427,6 +458,7 @@ pub async fn start_session(
     let session_id_clone = req.session_id.clone();
     let backend_url_clone = req.backend_api_url.clone();
     let backend_key_clone = req.backend_api_key.clone();
+    let lockdown_enabled = req.lockdown_enabled;
 
     tokio::task::spawn(async move {
         watch_supervisor(
@@ -434,6 +466,7 @@ pub async fn start_session(
             supervisor_child,
             state_clone,
             cleanup_policy,
+            lockdown_enabled,
             backend_url_clone,
             backend_key_clone,
         )
