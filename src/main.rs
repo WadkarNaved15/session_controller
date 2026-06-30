@@ -30,6 +30,8 @@ async fn main() {
         .route("/start-session", post(api::start_session))
         .route("/stop-session", post(api::stop_session))
         .route("/list-sessions", get(api::list_sessions))
+        // ✨ NEW: Endpoints for web server restart
+        // .route("/prepare-for-next-stream", post(api::prepare_for_next_stream))
         .route("/health", get(|| async {
             Json(json!({
                 "status": "ok",

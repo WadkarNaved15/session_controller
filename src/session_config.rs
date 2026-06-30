@@ -181,8 +181,8 @@ pub fn write_session_config(
         },
 
         moonlight: MoonlightConfig {
-            service_names: vec!["ApolloService".into()],
-            process_names: vec!["apollo.exe", "web-server.exe", "sunshine.exe", "streamer.exe"]
+            service_names: vec![],
+            process_names: vec!["streamer.exe"]
                 .into_iter()
                 .map(String::from)
                 .collect(),

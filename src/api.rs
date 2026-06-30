@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::process::Child;
 use tracing::{error, info, warn};
+use std::process::Stdio;
+use tokio::process::Command;
+use tokio::net::TcpStream;
+use std::time::Duration;
 
 use crate::{
     cleanup::{self, CleanupStrategy},
@@ -12,7 +16,6 @@ use crate::{
     supervisor,
 };
 
-/// Notification to backend about session status
 async fn notify_backend(
     api_url: &str,
     api_key: &str,
@@ -58,7 +61,153 @@ async fn notify_backend(
     }
 }
 
-/// Background task that watches supervisor process and handles its exit
+// ✨ NEW: Verify cleanup actually happened
+async fn verify_cleanup_complete(game_id: &str, build_id: &str) -> bool {
+    let build_root = format!("C:\\games\\{}\\{}", game_id, build_id);
+    let session_dir = Path::new(&build_root).join("session");
+    
+    if session_dir.exists() {
+        warn!(
+            game_id = %game_id,
+            build_id = %build_id,
+            "Session directory still exists after cleanup"
+        );
+        return false;
+    }
+    
+    true
+}
+
+// ✨ NEW: Force cleanup if verification fails
+async fn force_cleanup(game_id: &str, build_id: &str) -> Result<(), String> {
+    use std::process::Command;
+    
+    let build_root = format!("C:\\games\\{}\\{}", game_id, build_id);
+    
+    info!(
+        game_id = %game_id,
+        build_id = %build_id,
+        "Attempting force cleanup"
+    );
+    
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Remove-Item -Path '{}\\session' -Recurse -Force -ErrorAction SilentlyContinue; exit $?",
+                build_root
+            ),
+        ])
+        .output()
+        .map_err(|e| format!("Failed to execute cleanup: {}", e))?;
+
+    if output.status.success() {
+        info!("Force cleanup succeeded");
+        Ok(())
+    } else {
+        Err(format!(
+            "Force cleanup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+// ✨ NEW: Clean session from memory
+async fn cleanup_session_resources(
+    session_id: &str,
+    app_state: &AppState,
+) {
+    info!(
+        session_id = %session_id,
+        "Cleaning up session resources"
+    );
+    
+    let config_cache = format!("C:\\Instance\\cache\\{}.json", session_id);
+    let _ = std::fs::remove_file(&config_cache);
+    
+    info!(
+        session_id = %session_id,
+        "Session resources cleaned up"
+    );
+}
+
+// ✨ NEW: Gracefully stop web server
+async fn stop_web_server_graceful() -> Result<(), String> {
+    info!("Attempting graceful web server shutdown...");
+    
+    let output = std::process::Command::new("taskkill")
+        .args(["/IM", "web-server.exe"])
+        .output()
+        .map_err(|e| format!("Failed to execute taskkill: {}", e))?;
+
+    if output.status.success() {
+        info!("Graceful shutdown initiated");
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        Ok(())
+    } else {
+        warn!("Graceful shutdown failed, will attempt force kill");
+        Err("Graceful shutdown failed".to_string())
+    }
+}
+
+// ✨ NEW: Force kill web server
+async fn force_kill_web_server() -> Result<(), String> {
+    info!("Force killing web server...");
+    
+    let output = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "web-server.exe"])
+        .output()
+        .map_err(|e| format!("Failed to execute taskkill: {}", e))?;
+
+    if output.status.success() {
+        info!("Web server force killed");
+        Ok(())
+    } else {
+        warn!("Force kill output: {}", String::from_utf8_lossy(&output.stderr));
+        Ok(())
+    }
+}
+
+// ✨ NEW: Start web server
+async fn start_web_server() -> Result<u32, String> {
+    info!("Starting web server...");
+    
+    let child = std::process::Command::new("C:\\Instance\\web-server.exe")
+        .spawn()
+        .map_err(|e| format!("Failed to start web server: {}", e))?;
+
+    let pid = child.id();
+    info!(web_server_pid = pid, "Web server started successfully");
+    
+    Ok(pid)
+}
+
+// ✨ NEW: Restart web server (graceful → force → restart)
+async fn restart_web_server() -> Result<(), String> {
+    info!("Restarting web server");
+    
+    // Step 1: Graceful shutdown
+    let _ = stop_web_server_graceful().await;
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    
+    // Step 2: Force kill if still running
+    let _ = force_kill_web_server().await;
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    
+    // Step 3: Start fresh
+    match start_web_server().await {
+        Ok(pid) => {
+            info!(web_server_pid = pid, "Web server restart completed");
+            Ok(())
+        }
+        Err(e) => {
+            error!("Web server restart failed: {}", e);
+            Err(e)
+        }
+    }
+}
+
 async fn watch_supervisor(
     session_id: String,
     mut supervisor: Child,
@@ -74,7 +223,6 @@ async fn watch_supervisor(
         "Supervisor watcher started"
     );
 
-    // Wait for supervisor to exit
     let exit_status = match supervisor.wait().await {
         Ok(status) => status,
         Err(e) => {
@@ -84,7 +232,6 @@ async fn watch_supervisor(
                 "Failed to wait for supervisor process"
             );
 
-            // Update session state to failed
             {
                 let mut sessions = app_state.sessions.lock().unwrap();
                 if let Some(entry) = sessions.get_mut(&session_id) {
@@ -106,7 +253,6 @@ async fn watch_supervisor(
         "Supervisor exited"
     );
 
-    // Get session metadata
     let (game_id, build_id) = {
         let sessions = app_state.sessions.lock().unwrap();
         match sessions.get(&session_id) {
@@ -121,7 +267,6 @@ async fn watch_supervisor(
         }
     };
 
-    // Translate exit code to ExitReason
     let reason = ExitReason::from_exit_code(exit_code);
 
     info!(
@@ -130,8 +275,6 @@ async fn watch_supervisor(
         "Translated supervisor exit code to reason"
     );
 
-    // ✨ LOCKDOWN MODE: Always cleanup
-    // NORMAL MODE: Selective cleanup based on reason
     let should_cleanup = if lockdown_enabled {
         info!(
             session_id = %session_id,
@@ -140,7 +283,6 @@ async fn watch_supervisor(
         true
     } else {
         match reason {
-            // Only cleanup on game termination
             ExitReason::GameExitedNormally => cleanup_policy.on_normal_exit,
             ExitReason::GameExitedWithError => cleanup_policy.on_normal_exit,
             ExitReason::MaxDurationExceeded => cleanup_policy.on_timeout,
@@ -148,12 +290,8 @@ async fn watch_supervisor(
             ExitReason::IntegrityViolation => cleanup_policy.on_violation,
             ExitReason::LaunchTimeout => cleanup_policy.on_violation,
             ExitReason::TotalFocusLossExceeded => cleanup_policy.on_violation,
-            
-            // DON'T cleanup on non-terminal violations (normal mode only)
             ExitReason::FocusLost => false,
             ExitReason::UnauthorizedProcess => false,
-            
-            // Other cases
             _ => false,
         }
     };
@@ -168,11 +306,9 @@ async fn watch_supervisor(
             "Cleanup required"
         );
 
-        // Determine cleanup strategy
         let strategy = if !cleanup_policy.delete_game_files {
             CleanupStrategy::DeleteSessionOnly
         } else if cleanup_policy.shared_build {
-            // TODO: Check if other sessions are using this build
             CleanupStrategy::DeleteSessionOnly
         } else {
             CleanupStrategy::DeleteBuild
@@ -184,7 +320,6 @@ async fn watch_supervisor(
             "Cleanup strategy determined"
         );
 
-        // Update state to cleaning up
         {
             let mut sessions = app_state.sessions.lock().unwrap();
             if let Some(entry) = sessions.get_mut(&session_id) {
@@ -192,7 +327,6 @@ async fn watch_supervisor(
             }
         }
 
-        // Execute cleanup
         match cleanup::cleanup_session(&game_id, &build_id, strategy) {
             Ok(_) => {
                 info!(
@@ -210,6 +344,54 @@ async fn watch_supervisor(
                 );
             }
         }
+        
+        // ✨ NEW: Verify cleanup completion
+        info!(
+            session_id = %session_id,
+            "Verifying cleanup completion..."
+        );
+        
+        let mut verification_attempts = 0;
+        let max_attempts = 3;
+        let mut cleanup_verified = false;
+        
+        while verification_attempts < max_attempts && !cleanup_verified {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            
+            cleanup_verified = verify_cleanup_complete(&game_id, &build_id).await;
+            verification_attempts += 1;
+            
+            if !cleanup_verified {
+                warn!(
+                    session_id = %session_id,
+                    attempt = verification_attempts,
+                    "Cleanup verification failed, retrying..."
+                );
+                
+                if verification_attempts < max_attempts {
+                    if let Err(e) = force_cleanup(&game_id, &build_id).await {
+                        warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "Force cleanup attempt failed"
+                        );
+                    }
+                }
+            }
+        }
+        
+        if cleanup_verified {
+            info!(
+                session_id = %session_id,
+                "Cleanup verification successful"
+            );
+        } else {
+            error!(
+                session_id = %session_id,
+                "Cleanup verification FAILED after {} attempts, but continuing",
+                max_attempts
+            );
+        }
     } else {
         info!(
             session_id = %session_id,
@@ -218,21 +400,37 @@ async fn watch_supervisor(
         );
     }
 
-    // Notify backend of session end
-    notify_backend(&backend_url, &backend_key, &session_id, "ended", None).await;
+    // ✨ NEW: Clean session resources from memory
+    cleanup_session_resources(&session_id, &app_state).await;
 
-    // Update final session state
+    // ✨ NEW: Restart web server after cleanup
+    // info!(
+    //     session_id = %session_id,
+    //     "Restarting web server after cleanup"
+    // );
+    
+    // if let Err(e) = restart_web_server().await {
+    //     warn!(
+    //         session_id = %session_id,
+    //         error = %e,
+    //         "Web server restart failed (non-blocking)"
+    //     );
+    // }
+
+    notify_backend(&backend_url, &backend_key, &session_id, "ended_and_ready", None).await;
+
     {
         let mut sessions = app_state.sessions.lock().unwrap();
         if let Some(entry) = sessions.get_mut(&session_id) {
             entry.state = SessionState::Ended;
             entry.supervisor_handle = None;
         }
+        sessions.remove(&session_id);
     }
 
     info!(
         session_id = %session_id,
-        "Supervisor watcher completed"
+        "Supervisor watcher completed, instance ready for reuse"
     );
 }
 
@@ -248,7 +446,6 @@ pub struct StartSessionRequest {
     pub backend_api_url: String,
     pub backend_api_key: String,
     
-    // Cleanup policy from backend
     #[serde(default)]
     pub cleanup_on_normal_exit: bool,
     #[serde(default = "default_cleanup_on_violation")]
@@ -260,7 +457,6 @@ pub struct StartSessionRequest {
     #[serde(default)]
     pub shared_build: bool,
 
-    // ✨ NEW: Lockdown mode flag from backend
     #[serde(default)]
     pub lockdown_enabled: bool,
 }
@@ -268,6 +464,7 @@ pub struct StartSessionRequest {
 fn default_cleanup_on_violation() -> bool {
     true
 }
+
 fn default_cleanup_on_timeout() -> bool {
     true
 }
@@ -276,6 +473,7 @@ pub async fn start_session(
     State(state): State<AppState>,
     Json(req): Json<StartSessionRequest>,
 ) -> Result<Json<serde_json::Value>, String> {
+    info!("START_SESSION ENTERED");
     info!(
         session_id = %req.session_id,
         game_id = %req.game_id,
@@ -284,7 +482,6 @@ pub async fn start_session(
         "Starting session"
     );
 
-    // Check for duplicate session
     {
         let sessions = state.sessions.lock().unwrap();
         if sessions.contains_key(&req.session_id) {
@@ -296,7 +493,6 @@ pub async fn start_session(
     let exe_path = format!("{}\\game\\{}", build_root, req.start_path);
     let session_dir = Path::new(&build_root).join("session");
 
-    // Create session entry in Provisioning state
     {
         state.sessions.lock().unwrap().insert(
             req.session_id.clone(),
@@ -310,7 +506,6 @@ pub async fn start_session(
         );
     }
 
-    // Notify backend: provisioning started
     notify_backend(
         &req.backend_api_url,
         &req.backend_api_key,
@@ -319,8 +514,10 @@ pub async fn start_session(
         None,
     )
     .await;
+    
 
-    // Provision game build
+    info!("BEFORE ensure_game_ready");
+
     if let Err(e) = provisioner::ensure_game_ready(
         &req.game_id,
         &req.build_id,
@@ -342,7 +539,6 @@ pub async fn start_session(
         )
         .await;
 
-        // Update state to failed
         {
             let mut sessions = state.sessions.lock().unwrap();
             if let Some(entry) = sessions.get_mut(&req.session_id) {
@@ -353,7 +549,8 @@ pub async fn start_session(
         return Err(e.to_string());
     }
 
-    // Build cleanup policy from request
+    info!("AFTER ensure_game_ready");
+
     let cleanup_policy = session_config::CleanupConfig {
         on_normal_exit: req.cleanup_on_normal_exit,
         on_violation: req.cleanup_on_violation,
@@ -362,7 +559,8 @@ pub async fn start_session(
         shared_build: req.shared_build,
     };
 
-    // Write session.json with cleanup policy
+    info!("BEFORE write_session_config");
+
     let session_json = match session_config::write_session_config(
         &session_dir,
         &req.session_id,
@@ -391,7 +589,6 @@ pub async fn start_session(
             )
             .await;
 
-            // Update state to failed
             {
                 let mut sessions = state.sessions.lock().unwrap();
                 if let Some(entry) = sessions.get_mut(&req.session_id) {
@@ -402,8 +599,8 @@ pub async fn start_session(
             return Err(e.to_string());
         }
     };
+    info!("AFTER write_session_config");
 
-    // Notify backend: launching supervisor
     notify_backend(
         &req.backend_api_url,
         &req.backend_api_key,
@@ -413,7 +610,8 @@ pub async fn start_session(
     )
     .await;
 
-    // Spawn supervisor process
+    info!("BEFORE start_supervisor");
+
     let supervisor_child = match supervisor::start_supervisor(&session_json).await {
         Ok(c) => c,
         Err(e) => {
@@ -432,7 +630,6 @@ pub async fn start_session(
             )
             .await;
 
-            // Update state to failed
             {
                 let mut sessions = state.sessions.lock().unwrap();
                 if let Some(entry) = sessions.get_mut(&req.session_id) {
@@ -444,7 +641,11 @@ pub async fn start_session(
         }
     };
 
-    // Update state to Launching (supervisor spawned)
+
+    info!("AFTER start_supervisor");
+
+
+
     {
         let mut sessions = state.sessions.lock().unwrap();
         if let Some(entry) = sessions.get_mut(&req.session_id) {
@@ -453,7 +654,6 @@ pub async fn start_session(
         }
     }
 
-    // Spawn background watcher task
     let state_clone = state.clone();
     let session_id_clone = req.session_id.clone();
     let backend_url_clone = req.backend_api_url.clone();
@@ -477,6 +677,8 @@ pub async fn start_session(
         session_id = %req.session_id,
         "Session started, supervisor watcher spawned"
     );
+
+    info!("RETURNING HTTP RESPONSE");
 
     Ok(Json(serde_json::json!({
         "status": "started",
@@ -510,15 +712,10 @@ pub async fn stop_session(
         }
 
         let pid = entry.supervisor_handle.unwrap();
-
-        // Mark as user-initiated stop
         entry.state = SessionState::Stopping;
-
         pid
     };
 
-    // Kill supervisor process
-    // The background watcher will detect the exit and handle cleanup
     match supervisor::kill_supervisor(supervisor_pid).await {
         Ok(_) => {
             info!(
@@ -570,3 +767,55 @@ pub async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionInf
 
     Json(list)
 }
+
+// ✨ NEW: Prepare for next stream endpoint
+// #[derive(Deserialize)]
+// pub struct PrepareForNextStreamRequest {
+//     pub session_id: String,
+//     pub force_restart: Option<bool>,
+// }
+
+// #[derive(Serialize)]
+// pub struct PrepareForNextStreamResponse {
+//     pub ready: bool,
+//     pub message: String,
+// }
+
+// // ✅ FIXED: Correct function signature for Axum handler
+// pub async fn prepare_for_next_stream(
+//     State(state): State<AppState>,
+//     Json(req): Json<PrepareForNextStreamRequest>,
+// ) -> Json<PrepareForNextStreamResponse> {
+//     info!(
+//         session_id = %req.session_id,
+//         "Preparing instance for next stream"
+//     );
+
+//     let force = req.force_restart.unwrap_or(false);
+
+//     if force {
+//         info!("Force restarting web server");
+//         let _ = force_kill_web_server().await;
+//         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+//     } else {
+//         let _ = stop_web_server_graceful().await;
+//         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+//     }
+
+//     match start_web_server().await {
+//         Ok(pid) => {
+//             info!(web_server_pid = pid, "Instance prepared for next stream");
+//             Json(PrepareForNextStreamResponse {
+//                 ready: true,
+//                 message: format!("Web server restarted (PID: {})", pid),
+//             })
+//         }
+//         Err(e) => {
+//             error!("Failed to restart web server: {}", e);
+//             Json(PrepareForNextStreamResponse {
+//                 ready: false,
+//                 message: format!("Web server restart failed: {}", e),
+//             })
+//         }
+//     }
+// }
